@@ -226,10 +226,37 @@ Por padrão (`GB_ENV_STRATEGY=existing`) só marca environments que já existem 
 
 A API v2 usa um array top-level `rules`, em que cada regra declara o escopo com `environments: [...]` (ou `allEnvironments`).
 
+## Cache do LaunchDarkly
+
+Para não consumir a cota da API do LD em execuções repetidas, `migrate` e `sync` gravam as respostas em `./ld-cache/` (sobrescrevível com `LD_CACHE_DIR`).
+
+| Arquivo | Conteúdo |
+|---------|----------|
+| `projects.json` | Lista de projetos |
+| `environments.json` | Ambientes por `projectKey` |
+| `flags.json` | Flags por `projectKey` (inclui targeting com `summary=0`) |
+| `rules.json` | Extrato das rules aninhadas nas flags (não é um endpoint LD separado) |
+| `variations.json` | Extrato das variations aninhadas nas flags |
+| `segments.json` | Segmentos por `projectKey` + environment |
+
+Comportamento:
+
+1. Se o dado já existir no cache → usa o arquivo e **não** chama a API.
+2. Se não existir → faz o request ao LD, salva o JSON e segue.
+3. `rules.json` e `variations.json` são derivados de `flags.json` sempre que flags são buscadas (ou lidas do cache sem esses arquivos).
+
+Para forçar dados novos do LD, apague a pasta (ou um arquivo específico):
+
+```bash
+rm -rf ld-cache
+```
+
+A pasta está no `.gitignore` e não deve ser commitada.
+
 ## Testes
 
 ```bash
 npm test
 ```
 
-Cobertura: dedupe de variações, clauses→conditions, segments→saved groups, rules/rollouts ativos, consolidação de fallthroughs por valor, nomes de variation na `description`, merge que remove fallthroughs legados, match de projetos/ambientes, config.json (schema, shared/unique, conflitos de id/name) e idempotência de ids de importação.
+Cobertura: dedupe de variações, clauses→conditions, segments→saved groups, rules/rollouts ativos, consolidação de fallthroughs por valor, nomes de variation na `description`, merge que remove fallthroughs legados, match de projetos/ambientes, config.json (schema, shared/unique, conflitos de id/name), idempotência de ids de importação e cache local das respostas do LaunchDarkly.

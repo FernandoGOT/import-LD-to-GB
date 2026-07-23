@@ -75,3 +75,6 @@ ld-growthbook-migrate-*.json
 
 # Local import remap/ignore (keep config.example.json versioned)
 /config.json
+
+# LaunchDarkly API response cache (local only)
+/ld-cache/
