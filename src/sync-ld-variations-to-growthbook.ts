@@ -10,6 +10,18 @@ import {
   parseProjectMap,
   requiredEnv,
 } from "./api/http.js";
+import {
+  defaultConfigPath,
+  filterAndRemapVariations,
+  isFlagIgnored,
+  isProjectIgnored,
+  loadImportConfig,
+  remapFlag,
+  remapProject,
+  sanitizeFeatureId,
+  summarizeImportConfig,
+  type ImportConfig,
+} from "./config.js";
 import { matchOrPlanCreateProject } from "./mappers/projects.js";
 import { normalizeRulesForGrowthBookApi } from "./normalize-rules.js";
 import type { GrowthBookProject } from "./types/migrate.js";
@@ -31,6 +43,8 @@ type Report = {
   finishedAt?: string;
   dryRun: boolean;
   config: {
+    configPath: string;
+    importConfig: Record<string, unknown>;
     projectMatchStrategy: string;
     gbEnvStrategy: string;
     allowCreateEnvBlocks: boolean;
@@ -75,6 +89,7 @@ type Report = {
       | "missing_gb_project"
       | "missing_gb_feature"
       | "no_target_environments"
+      | "skipped_ignored"
       | "error";
     ruleCount?: number;
     consolidatedCount?: number;
@@ -116,12 +131,18 @@ const ALLOW_CREATE_ENV_BLOCKS = parseBoolean(
 const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS ?? "250");
 const REPORT_PATH =
   process.env.REPORT_PATH ?? "./ld-growthbook-variation-report.json";
+const CONFIG_PATH = defaultConfigPath();
 
 async function main() {
+  console.log(`Carregando e validando config: ${CONFIG_PATH}`);
+  const importConfig = await loadImportConfig(CONFIG_PATH);
+
   const report: Report = {
     startedAt: new Date().toISOString(),
     dryRun: DRY_RUN,
     config: {
+      configPath: CONFIG_PATH,
+      importConfig: summarizeImportConfig(importConfig),
       projectMatchStrategy: PROJECT_MATCH_STRATEGY,
       gbEnvStrategy: GB_ENV_STRATEGY,
       allowCreateEnvBlocks: ALLOW_CREATE_ENV_BLOCKS,
@@ -163,14 +184,31 @@ async function main() {
   });
 
   console.log("Buscando projetos no LaunchDarkly...");
-  const ldProjects = await ld.listProjects();
+  const allLdProjects = await ld.listProjects();
+  const ldProjects = allLdProjects.filter((project) => {
+    if (isProjectIgnored(importConfig, project.key)) {
+      report.actions.push({
+        ldProjectKey: project.key,
+        flagKey: "*",
+        action: "skipped_ignored",
+        details: "Projeto ignorado via config.json",
+      });
+      return false;
+    }
+    return true;
+  });
   report.totals.ldProjects = ldProjects.length;
 
   console.log("Buscando flags e variações no LaunchDarkly...");
   const ldFlagsByProject = new Map<string, LaunchDarklyFlag[]>();
 
   for (const project of ldProjects) {
-    const flags = await ld.listFlags(project.key);
+    const envs = await ld.listEnvironments(project.key);
+    await delay(REQUEST_DELAY_MS);
+    const flags = await ld.listFlags(
+      project.key,
+      envs.map((env) => env.key),
+    );
     ldFlagsByProject.set(project.key, flags);
     report.totals.ldFlags += flags.length;
     console.log(`LD ${project.key}: ${flags.length} flags`);
@@ -181,7 +219,11 @@ async function main() {
   const gbProjects = await gb.listProjects();
   report.totals.gbProjects = gbProjects.length;
 
-  const gbProjectByLdProjectKey = matchProjects(ldProjects, gbProjects);
+  const gbProjectByLdProjectKey = matchProjects(
+    ldProjects,
+    gbProjects,
+    importConfig,
+  );
 
   for (const [ldProjectKey, gbProject] of gbProjectByLdProjectKey.entries()) {
     const ldProject = ldProjects.find((p) => p.key === ldProjectKey);
@@ -240,7 +282,23 @@ async function main() {
     }
 
     for (const ldFlag of ldFlags) {
-      const gbFeature = gbFeatureIndex.get(ldFlag.key);
+      if (isFlagIgnored(importConfig, ldProject.key, ldFlag.key)) {
+        report.actions.push({
+          ldProjectKey: ldProject.key,
+          gbProjectId: gbProject.id,
+          flagKey: ldFlag.key,
+          action: "skipped_ignored",
+          details: "Flag ignorada via config.json",
+        });
+        continue;
+      }
+
+      const remappedFlag = remapFlag(importConfig, ldProject.key, ldFlag.key, {
+        key: ldFlag.key,
+        name: ldFlag.name,
+      });
+      const effectiveFlagKey = sanitizeFeatureId(remappedFlag.key);
+      const gbFeature = gbFeatureIndex.get(effectiveFlagKey);
 
       if (!gbFeature) {
         report.totals.skippedFlagsWithoutGbFeature += 1;
@@ -250,15 +308,22 @@ async function main() {
           flagKey: ldFlag.key,
           action: "missing_gb_feature",
           details:
-            "A flag existe no LaunchDarkly, mas não foi encontrada no GrowthBook com o mesmo id/key.",
+            `A flag existe no LaunchDarkly, mas não foi encontrada no GrowthBook com id/key "${effectiveFlagKey}".`,
         });
         continue;
       }
 
       report.totals.matchedFeatures += 1;
 
-      const ldVariations = uniqueLdVariationsByValue(
+      const filteredVariations = filterAndRemapVariations(
+        importConfig,
+        ldProject.key,
+        ldFlag.key,
         ldFlag.variations ?? [],
+      );
+
+      const ldVariations = uniqueLdVariationsByValue(
+        filteredVariations,
         gbFeature.valueType,
       );
       if (ldVariations.length === 0) {
@@ -268,7 +333,7 @@ async function main() {
           flagKey: ldFlag.key,
           gbFeatureId: gbFeature.id,
           action: "no_missing_variations",
-          details: "Flag sem variações no payload do LaunchDarkly.",
+          details: "Flag sem variações no payload do LaunchDarkly (após filtros do config).",
         });
         continue;
       }
@@ -294,13 +359,13 @@ async function main() {
         ldVariations,
         feature: gbFeature,
         ldProjectKey: ldProject.key,
-        flagKey: ldFlag.key,
+        flagKey: effectiveFlagKey,
       });
 
       const newRules = missingVariations.map((variation) =>
         buildDisabledGrowthBookRule({
           ldProject,
-          ldFlag,
+          ldFlag: { ...ldFlag, key: effectiveFlagKey },
           gbFeature,
           variation,
           environments: targetEnvKeys,
@@ -449,16 +514,23 @@ function resolveTargetEnvironmentKeys(feature: GrowthBookFeature): string[] {
 function matchProjects(
   ldProjects: LaunchDarklyProject[],
   gbProjects: GrowthBookProject[],
+  importConfig: ImportConfig,
 ): Map<string, GrowthBookProject> {
   const result = new Map<string, GrowthBookProject>();
 
   for (const ldProject of ldProjects) {
+    const effective = remapProject(importConfig, ldProject.key, {
+      key: ldProject.key,
+      name: ldProject.name,
+    });
     const decision = matchOrPlanCreateProject({
       ldProject,
       gbProjects,
       strategy: PROJECT_MATCH_STRATEGY,
       projectMap: PROJECT_MAP_JSON,
       allowCreate: false,
+      effectiveKey: effective.key,
+      effectiveName: effective.name,
     });
 
     if (decision.action === "matched") {

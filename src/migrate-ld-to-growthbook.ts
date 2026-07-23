@@ -9,7 +9,23 @@ import {
   parseProjectMap,
   requiredEnv,
 } from "./api/http.js";
-import { collectUniqueLdEnvironmentKeys, planEnvironmentUpsert } from "./mappers/environments.js";
+import {
+  assertNoEnvironmentConflicts,
+  buildEffectiveEnvKeyMap,
+  defaultConfigPath,
+  filterAndRemapVariations,
+  isFlagIgnored,
+  isProjectIgnored,
+  loadImportConfig,
+  remapFlag,
+  remapProject,
+  summarizeImportConfig,
+  type ImportConfig,
+} from "./config.js";
+import {
+  planEnvironmentUpsert,
+  planEnvironmentsForProjects,
+} from "./mappers/environments.js";
 import {
   buildFeatureFromLdFlag,
   planFeatureUpdate,
@@ -116,12 +132,18 @@ const GB_FEATURE_OWNER =
 const REQUEST_DELAY_MS = Number(process.env.REQUEST_DELAY_MS ?? "250");
 const REPORT_PATH =
   process.env.REPORT_PATH ?? "./ld-growthbook-migrate-report.json";
+const CONFIG_PATH = defaultConfigPath();
 
 async function main() {
+  console.log(`Carregando e validando config: ${CONFIG_PATH}`);
+  const importConfig = await loadImportConfig(CONFIG_PATH);
+
   const report: MigrateReport = {
     startedAt: new Date().toISOString(),
     dryRun: DRY_RUN,
     config: {
+      configPath: CONFIG_PATH,
+      importConfig: summarizeImportConfig(importConfig),
       projectMatchStrategy: PROJECT_MATCH_STRATEGY,
       migrateCreateProjects: MIGRATE_CREATE_PROJECTS,
       migrateCreateEnvironments: MIGRATE_CREATE_ENVIRONMENTS,
@@ -175,25 +197,50 @@ async function main() {
   });
 
   console.log("Buscando projetos no LaunchDarkly...");
-  const ldProjects = await ld.listProjects();
+  const allLdProjects = await ld.listProjects();
+  const ldProjects = allLdProjects.filter((project) => {
+    if (isProjectIgnored(importConfig, project.key)) {
+      report.actions.push({
+        type: "project",
+        action: "skipped_ignored",
+        ldProjectKey: project.key,
+      });
+      return false;
+    }
+    return true;
+  });
   report.totals.ldProjects = ldProjects.length;
 
   const ldEnvsByProject = new Map<string, LaunchDarklyEnvironment[]>();
   const ldFlagsByProject = new Map<string, LaunchDarklyFlagDetail[]>();
+  const envKeyMapByProject = new Map<string, Map<string, string>>();
 
   for (const project of ldProjects) {
     const envs = await ld.listEnvironments(project.key);
     ldEnvsByProject.set(project.key, envs);
     report.totals.ldEnvironments += envs.length;
+    envKeyMapByProject.set(
+      project.key,
+      buildEffectiveEnvKeyMap(importConfig, project.key, envs),
+    );
     console.log(`LD ${project.key}: ${envs.length} environments`);
     await delay(REQUEST_DELAY_MS);
 
-    const flags = await ld.listFlags(project.key);
+    const flags = await ld.listFlags(
+      project.key,
+      envs.map((env) => env.key),
+    );
     ldFlagsByProject.set(project.key, flags);
     report.totals.ldFlags += flags.length;
     console.log(`LD ${project.key}: ${flags.length} flags`);
     await delay(REQUEST_DELAY_MS);
   }
+
+  assertNoEnvironmentConflicts(
+    importConfig,
+    ldEnvsByProject,
+    ldProjects.map((project) => project.key),
+  );
 
   console.log("Buscando projetos/ambientes/saved groups no GrowthBook...");
   let gbProjects = await gb.listProjects();
@@ -209,12 +256,18 @@ async function main() {
 
   console.log("Sincronizando projetos...");
   for (const ldProject of ldProjects) {
+    const effective = remapProject(importConfig, ldProject.key, {
+      key: ldProject.key,
+      name: ldProject.name,
+    });
     const decision = matchOrPlanCreateProject({
       ldProject,
       gbProjects,
       strategy: PROJECT_MATCH_STRATEGY,
       projectMap: PROJECT_MAP_JSON,
       allowCreate: MIGRATE_CREATE_PROJECTS,
+      effectiveKey: effective.key,
+      effectiveName: effective.name,
     });
 
     if (decision.action === "matched") {
@@ -287,22 +340,25 @@ async function main() {
   }
 
   console.log("Sincronizando ambientes...");
-  const uniqueLdEnvs = collectUniqueLdEnvironmentKeys(ldEnvsByProject);
-  for (const ldEnv of uniqueLdEnvs) {
-    // Prefer attaching to first matched project that has this env; else org-wide.
-    const ownerProjectKey = [...ldEnvsByProject.entries()].find(([, envs]) =>
-      envs.some((env) => env.key === ldEnv.key),
-    )?.[0];
-    const gbProject = ownerProjectKey
-      ? gbProjectByLdKey.get(ownerProjectKey)
-      : undefined;
+  const plannedEnvironments = planEnvironmentsForProjects({
+    config: importConfig,
+    ldEnvsByProject,
+    activeProjectKeys: ldProjects.map((project) => project.key),
+  });
 
+  for (const planned of plannedEnvironments) {
+    const gbProject = gbProjectByLdKey.get(planned.ldProjectKey);
     const decision = planEnvironmentUpsert({
-      ldEnvironment: ldEnv,
+      ldEnvironment: planned.ldEnvironment,
       gbEnvironments,
-      gbProjectId: gbProject && !gbProject.id.startsWith("dry-run-")
-        ? gbProject.id
-        : undefined,
+      gbProjectId:
+        gbProject && !gbProject.id.startsWith("dry-run-")
+          ? gbProject.id
+          : undefined,
+      effectiveId: planned.effectiveId,
+      effectiveDescription: planned.effectiveDescription,
+      strategy: planned.strategy,
+      ldProjectKey: planned.ldProjectKey,
     });
 
     if (decision.action === "matched") {
@@ -310,7 +366,10 @@ async function main() {
       report.actions.push({
         type: "environment",
         action: "matched",
-        environmentKey: ldEnv.key,
+        environmentKey: planned.effectiveId,
+        ldEnvironmentKey: planned.ldEnvironment.key,
+        ldProjectKey: planned.ldProjectKey,
+        strategy: planned.strategy,
       });
       continue;
     }
@@ -319,7 +378,10 @@ async function main() {
       report.actions.push({
         type: "environment",
         action: "skipped_create_disabled",
-        environmentKey: ldEnv.key,
+        environmentKey: planned.effectiveId,
+        ldEnvironmentKey: planned.ldEnvironment.key,
+        ldProjectKey: planned.ldProjectKey,
+        strategy: planned.strategy,
       });
       continue;
     }
@@ -331,10 +393,18 @@ async function main() {
         action: "would_create",
         environmentKey: decision.id,
         description: decision.description,
+        ldEnvironmentKey: planned.ldEnvironment.key,
+        ldProjectKey: planned.ldProjectKey,
+        strategy: planned.strategy,
+        projects: decision.projects,
       });
       gbEnvironments = [
         ...gbEnvironments,
-        { id: decision.id, description: decision.description },
+        {
+          id: decision.id,
+          description: decision.description,
+          projects: decision.projects,
+        },
       ];
       continue;
     }
@@ -353,6 +423,9 @@ async function main() {
         type: "environment",
         action: "created",
         environmentKey: created.id,
+        ldEnvironmentKey: planned.ldEnvironment.key,
+        ldProjectKey: planned.ldProjectKey,
+        strategy: planned.strategy,
       });
       await delay(REQUEST_DELAY_MS);
     } catch (error) {
@@ -360,7 +433,9 @@ async function main() {
       report.actions.push({
         type: "environment",
         action: "error",
-        environmentKey: ldEnv.key,
+        environmentKey: planned.effectiveId,
+        ldEnvironmentKey: planned.ldEnvironment.key,
+        ldProjectKey: planned.ldProjectKey,
         details: error instanceof Error ? error.message : String(error),
       });
     }
@@ -375,7 +450,17 @@ async function main() {
     if (!gbProject) continue;
 
     const envs = ldEnvsByProject.get(ldProject.key) ?? [];
+    const envKeyMap = envKeyMapByProject.get(ldProject.key);
     for (const env of envs) {
+      if (envKeyMap && !envKeyMap.has(env.key)) {
+        report.actions.push({
+          type: "segment",
+          action: "skipped_ignored_environment",
+          ldProjectKey: ldProject.key,
+          environmentKey: env.key,
+        });
+        continue;
+      }
       let segments;
       try {
         segments = await ld.listSegments(ldProject.key, env.key);
@@ -541,7 +626,23 @@ async function main() {
     const ldFlags = ldFlagsByProject.get(ldProject.key) ?? [];
 
     for (const ldFlag of ldFlags) {
+      if (isFlagIgnored(importConfig, ldProject.key, ldFlag.key)) {
+        report.actions.push({
+          type: "feature",
+          action: "skipped_ignored",
+          ldProjectKey: ldProject.key,
+          flagKey: ldFlag.key,
+        });
+        continue;
+      }
+
       try {
+        const remappedFlag = remapFlag(importConfig, ldProject.key, ldFlag.key, {
+          key: ldFlag.key,
+          name: ldFlag.name,
+        });
+        const envKeyMap = envKeyMapByProject.get(ldProject.key);
+
         const built = buildFeatureFromLdFlag({
           ldProjectKey: ldProject.key,
           ldFlag,
@@ -549,6 +650,10 @@ async function main() {
             ? ""
             : gbProject.id,
           owner: GB_FEATURE_OWNER,
+          effectiveFeatureId: remappedFlag.key,
+          effectiveDescription:
+            remappedFlag.name ?? ldFlag.description ?? ldFlag.name,
+          envKeyMap,
           resolveSavedGroupIdForEnv: (environmentKey) => {
             return (segmentKey: string) =>
               savedGroupIdByProjectEnvSegment.get(
@@ -723,6 +828,8 @@ async function main() {
               gbProject,
               gbFeature: feature,
               report,
+              importConfig,
+              envKeyMap: envKeyMapByProject.get(ldProject.key),
               updateFeature: async (featureId, rules) => {
                 if (DRY_RUN || gbProject.id.startsWith("dry-run-")) {
                   featureIndex.set(featureId, {
@@ -776,12 +883,17 @@ async function backfillVariations(input: {
   gbProject: GrowthBookProject;
   gbFeature: GrowthBookFeature;
   report: MigrateReport;
+  importConfig: ImportConfig;
+  envKeyMap?: Map<string, string>;
   updateFeature: (featureId: string, rules: GrowthBookFeature["rules"]) => Promise<void>;
 }): Promise<void> {
-  const { ldProject, ldFlag, gbFeature, report } = input;
+  const { ldProject, ldFlag, gbFeature, report, importConfig, envKeyMap } =
+    input;
   const targetEnvKeys = Object.keys(gbFeature.environments ?? {}).length
     ? Object.keys(gbFeature.environments ?? {})
-    : Object.keys(ldFlag.environments ?? {});
+    : envKeyMap && envKeyMap.size > 0
+      ? [...envKeyMap.values()]
+      : Object.keys(ldFlag.environments ?? {});
 
   if (targetEnvKeys.length === 0) {
     report.actions.push({
@@ -794,8 +906,21 @@ async function backfillVariations(input: {
     return;
   }
 
-  const ldVariations = uniqueLdVariationsByValue(
+  const remappedFlag = remapFlag(importConfig, ldProject.key, ldFlag.key, {
+    key: ldFlag.key,
+    name: ldFlag.name,
+  });
+  const effectiveFlagKey = remappedFlag.key;
+
+  const filteredVariations = filterAndRemapVariations(
+    importConfig,
+    ldProject.key,
+    ldFlag.key,
     ldFlag.variations ?? [],
+  );
+
+  const ldVariations = uniqueLdVariationsByValue(
+    filteredVariations,
     gbFeature.valueType,
   );
 
@@ -803,13 +928,13 @@ async function backfillVariations(input: {
     ldVariations,
     feature: gbFeature,
     ldProjectKey: ldProject.key,
-    flagKey: ldFlag.key,
+    flagKey: effectiveFlagKey,
   });
 
   const newRules = missingVariations.map((variation) =>
     buildDisabledGrowthBookRule({
       ldProject,
-      ldFlag,
+      ldFlag: { ...ldFlag, key: effectiveFlagKey },
       gbFeature,
       variation,
       environments: targetEnvKeys,

@@ -14,8 +14,13 @@ export function matchOrPlanCreateProject(input: {
   strategy: string;
   projectMap: Record<string, string>;
   allowCreate: boolean;
+  /** Effective key/name after config.json remap (defaults to LD project). */
+  effectiveKey?: string;
+  effectiveName?: string;
 }): ProjectMatchDecision {
   const { ldProject, gbProjects, strategy, projectMap, allowCreate } = input;
+  const effectiveKey = input.effectiveKey ?? ldProject.key;
+  const effectiveName = input.effectiveName ?? ldProject.name;
 
   if (strategy === "json") {
     const gbProjectId = projectMap[ldProject.key];
@@ -23,8 +28,8 @@ export function matchOrPlanCreateProject(input: {
       return allowCreate
         ? {
             action: "create",
-            publicId: ldProject.key,
-            name: ldProject.name,
+            publicId: effectiveKey,
+            name: effectiveName,
           }
         : { action: "unmatched" };
     }
@@ -37,8 +42,8 @@ export function matchOrPlanCreateProject(input: {
     return allowCreate
       ? {
           action: "create",
-          publicId: ldProject.key,
-          name: ldProject.name,
+          publicId: effectiveKey,
+          name: effectiveName,
         }
       : { action: "unmatched" };
   }
@@ -50,20 +55,20 @@ export function matchOrPlanCreateProject(input: {
   }
 
   const byPublicId = gbProjects.find(
-    (gbProject) => gbProject.publicId === ldProject.key,
+    (gbProject) => gbProject.publicId === effectiveKey,
   );
   if (byPublicId) {
     return { action: "matched", gbProject: byPublicId };
   }
 
-  const byId = gbProjects.find((gbProject) => gbProject.id === ldProject.key);
+  const byId = gbProjects.find((gbProject) => gbProject.id === effectiveKey);
   if (byId) {
     return { action: "matched", gbProject: byId };
   }
 
   const byName = gbProjects.find(
     (gbProject) =>
-      normalizeName(gbProject.name) === normalizeName(ldProject.name),
+      normalizeName(gbProject.name) === normalizeName(effectiveName),
   );
   if (byName) {
     return { action: "matched", gbProject: byName };
@@ -72,8 +77,8 @@ export function matchOrPlanCreateProject(input: {
   if (allowCreate) {
     return {
       action: "create",
-      publicId: ldProject.key,
-      name: ldProject.name,
+      publicId: effectiveKey,
+      name: effectiveName,
     };
   }
 

@@ -1,0 +1,68 @@
+{
+  "projects": {
+    "ignore": ["legacy-project"],
+    "remap": {
+      "ld-project-shared": {
+        "key": "shared-app",
+        "name": "Shared App",
+        "environmentStrategy": "shared"
+      },
+      "ld-project-unique": {
+        "key": "unique-app",
+        "name": "Unique App",
+        "environmentStrategy": "unique",
+        "environments": {
+          "ignore": ["test"],
+          "remap": {
+            "production": {
+              "key": "unique-app-prod",
+              "name": "Unique Prod"
+            },
+            "staging": {
+              "key": "unique-app-staging",
+              "name": "Unique Staging"
+            }
+          }
+        }
+      }
+    }
+  },
+  "environments": {
+    "ignore": ["test"],
+    "remap": {
+      "production": { "key": "prod", "name": "Production" },
+      "staging": { "key": "staging", "name": "Staging" }
+    }
+  },
+  "flags": {
+    "ignore": [
+      { "projectKey": "ld-project-shared", "flagKey": "old-flag" }
+    ],
+    "remap": [
+      {
+        "projectKey": "ld-project-shared",
+        "flagKey": "checkout-v1",
+        "key": "checkout",
+        "name": "Checkout"
+      }
+    ]
+  },
+  "variations": {
+    "ignore": [
+      {
+        "projectKey": "ld-project-shared",
+        "flagKey": "checkout-v1",
+        "variationId": "var-key-deprecated"
+      }
+    ],
+    "remap": [
+      {
+        "projectKey": "ld-project-shared",
+        "flagKey": "checkout-v1",
+        "variationId": "var-key-control",
+        "key": "control",
+        "name": "Baseline"
+      }
+    ]
+  }
+}

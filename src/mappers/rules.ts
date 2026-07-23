@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { mapClausesToGrowthBook, type SegmentIdResolver } from "./clauses.js";
 import {
+  canonicalValueKey,
+  mergeEnvironments,
   removeUndefinedFields,
   serializeGrowthBookValue,
   stableStringify,
@@ -69,7 +71,7 @@ export function buildRulesFromLdEnvironment(input: {
         ),
         description: `LD individual target (${attribute})`,
         condition: stableStringify(condition),
-        enabled: false,
+        enabled: true,
         scheduleType: "none",
         type: "force",
         value: serializeGrowthBookValue(value, input.valueType),
@@ -138,7 +140,7 @@ export function buildRulesFromLdEnvironment(input: {
             ? stableStringify(mapped.condition)
             : "",
           savedGroupTargeting: mapped.savedGroupTargeting,
-          enabled: false,
+          enabled: true,
           scheduleType: "none",
           type: "force",
           value: serializeGrowthBookValue(value, input.valueType),
@@ -187,9 +189,13 @@ export function buildRulesFromLdEnvironment(input: {
             input.environmentKey,
             "fallthrough",
           ),
-          description: "LD fallthrough",
+          description: variationDescription(
+            variations,
+            fallthrough.variation,
+            "LD fallthrough",
+          ),
           condition: "",
-          enabled: false,
+          enabled: true,
           scheduleType: "none",
           type: "force",
           value: serializeGrowthBookValue(value, input.valueType),
@@ -203,9 +209,85 @@ export function buildRulesFromLdEnvironment(input: {
   return { rules, warnings, prerequisiteKeys };
 }
 
+/**
+ * Collapse equivalent force rules (same value/condition/enabled) built per
+ * environment into a single rule spanning the union of environments.
+ * Rollouts and other rule types are left untouched.
+ */
+export function consolidateEquivalentForceRules(input: {
+  ldProjectKey: string;
+  flagKey: string;
+  valueType: string | undefined;
+  rules: GrowthBookRule[];
+}): GrowthBookRule[] {
+  const preserved: GrowthBookRule[] = [];
+  const groups = new Map<string, GrowthBookRule>();
+
+  for (const rule of input.rules) {
+    const type = typeof rule.type === "string" ? rule.type : "force";
+    if (type !== "force" || rule.allEnvironments === true) {
+      preserved.push(rule);
+      continue;
+    }
+
+    const condition =
+      typeof rule.condition === "string"
+        ? rule.condition
+        : rule.condition === undefined
+          ? ""
+          : stableStringify(rule.condition);
+    // Description is display-only; keep ids stable across renames.
+    const groupKey = [
+      String(rule.enabled ?? true),
+      condition,
+      stableStringify(rule.savedGroupTargeting ?? null),
+      canonicalValueKey(rule.value, input.valueType),
+    ].join("\0");
+
+    const existing = groups.get(groupKey);
+    if (!existing) {
+      const valueHash = createHash("sha1")
+        .update(groupKey)
+        .digest("hex")
+        .slice(0, 10);
+      groups.set(
+        groupKey,
+        removeUndefinedFields({
+          ...rule,
+          id: buildRuleId(
+            input.ldProjectKey,
+            input.flagKey,
+            "shared",
+            `force-${valueHash}`,
+          ),
+          allEnvironments: false,
+          environments: [...(rule.environments ?? [])],
+        }),
+      );
+      continue;
+    }
+
+    existing.environments = mergeEnvironments(
+      existing.environments,
+      rule.environments ?? [],
+    );
+    if (
+      (!existing.description || existing.description === "LD fallthrough") &&
+      typeof rule.description === "string" &&
+      rule.description.trim() &&
+      rule.description !== "LD fallthrough"
+    ) {
+      existing.description = rule.description;
+    }
+  }
+
+  return [...preserved, ...groups.values()];
+}
+
 export function mergeImportedRules(input: {
   existingRules: GrowthBookRule[];
   importedRules: GrowthBookRule[];
+  valueType?: string;
 }): {
   rules: GrowthBookRule[];
   createdCount: number;
@@ -235,11 +317,45 @@ export function mergeImportedRules(input: {
     }
   }
 
+  const importedIds = new Set(
+    input.importedRules
+      .map((rule) => (typeof rule.id === "string" ? rule.id : undefined))
+      .filter((id): id is string => Boolean(id)),
+  );
+  const importedForceFingerprints = new Set(
+    input.importedRules
+      .filter((rule) => isEmptyConditionForceRule(rule))
+      .map((rule) => forceRuleFingerprint(rule, input.valueType)),
+  );
+
   const merged: GrowthBookRule[] = [];
   const seen = new Set<string>();
+  let removedLegacyCount = 0;
 
   for (const rule of input.existingRules) {
     const id = typeof rule.id === "string" ? rule.id : undefined;
+    if (id && importedIds.has(id)) {
+      if (!seen.has(id)) {
+        merged.push(byId.get(id)!);
+        seen.add(id);
+      }
+      continue;
+    }
+
+    // Drop legacy fallthrough copies superseded by a renamed/re-id'd import.
+    if (
+      id &&
+      !importedIds.has(id) &&
+      isEmptyConditionForceRule(rule) &&
+      importedForceFingerprints.has(
+        forceRuleFingerprint(rule, input.valueType),
+      )
+    ) {
+      byId.delete(id);
+      removedLegacyCount += 1;
+      continue;
+    }
+
     if (id && byId.has(id)) {
       if (!seen.has(id)) {
         merged.push(byId.get(id)!);
@@ -260,7 +376,8 @@ export function mergeImportedRules(input: {
     }
   }
 
-  const changed = createdCount > 0 || replacedCount > 0;
+  const changed =
+    createdCount > 0 || replacedCount > 0 || removedLegacyCount > 0;
 
   return {
     rules: merged,
@@ -320,7 +437,7 @@ function buildRolloutRule(input: {
     description: input.description,
     condition: input.condition ? stableStringify(input.condition) : "",
     savedGroupTargeting: input.savedGroupTargeting,
-    enabled: false,
+    enabled: true,
     scheduleType: "none",
     type: "rollout",
     value:
@@ -340,6 +457,44 @@ function variationValue(
   index: number,
 ): unknown {
   return variations[index]?.value;
+}
+
+function variationDescription(
+  variations: LaunchDarklyVariation[],
+  index: number,
+  fallback: string,
+): string {
+  const name = variations[index]?.name?.trim();
+  return name || fallback;
+}
+
+function isEmptyConditionForceRule(rule: GrowthBookRule): boolean {
+  const type = typeof rule.type === "string" ? rule.type : "force";
+  if (type !== "force") return false;
+  const condition = rule.condition;
+  return (
+    condition === undefined ||
+    condition === "" ||
+    (typeof condition === "string" && condition.trim() === "")
+  );
+}
+
+function forceRuleFingerprint(
+  rule: GrowthBookRule,
+  valueType: string | undefined,
+): string {
+  const condition =
+    typeof rule.condition === "string"
+      ? rule.condition
+      : rule.condition === undefined
+        ? ""
+        : stableStringify(rule.condition);
+  return [
+    String(rule.enabled ?? true),
+    condition,
+    stableStringify(rule.savedGroupTargeting ?? null),
+    canonicalValueKey(rule.value, valueType),
+  ].join("\0");
 }
 
 function targetAttribute(target: LaunchDarklyTarget): string {

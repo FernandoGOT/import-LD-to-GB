@@ -70,3 +70,8 @@ junit.xml
 # Report files
 ld-growthbook-variation-report.json
 ld-growthbook-migrate-report.json
+ld-growthbook-variation-*.json
+ld-growthbook-migrate-*.json
+
+# Local import remap/ignore (keep config.example.json versioned)
+/config.json

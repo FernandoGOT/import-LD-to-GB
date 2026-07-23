@@ -1,5 +1,6 @@
 import {
   buildRulesFromLdEnvironment,
+  consolidateEquivalentForceRules,
   mergeImportedRules,
 } from "./rules.js";
 import type { SegmentIdResolver } from "./clauses.js";
@@ -14,6 +15,8 @@ import type {
   LaunchDarklyFlagDetail,
   RuleBuildWarning,
 } from "../types/migrate.js";
+import { sanitizeFeatureId } from "../config.js";
+import { mapEnvironmentKey } from "./environments.js";
 
 export type FeatureBuildResult = {
   createPayload: CreateFeaturePayload;
@@ -85,6 +88,12 @@ export function buildFeatureFromLdFlag(input: {
   resolveSavedGroupIdForEnv: (
     environmentKey: string,
   ) => SegmentIdResolver | undefined;
+  /** Effective feature id after config remap (defaults to sanitized LD flag key). */
+  effectiveFeatureId?: string;
+  /** Effective description after config remap. */
+  effectiveDescription?: string;
+  /** LD env key → GB env id map for this project. */
+  envKeyMap?: Map<string, string>;
 }): FeatureBuildResult {
   const valueType = inferValueType(input.ldFlag);
   const defaultValue = resolveDefaultValue({
@@ -96,10 +105,16 @@ export function buildFeatureFromLdFlag(input: {
   const warnings: RuleBuildWarning[] = [];
   const prerequisiteKeys = new Set<string>();
   const environments: Record<string, { enabled: boolean }> = {};
+  const envKeyMap = input.envKeyMap;
 
-  for (const [environmentKey, envConfig] of Object.entries(
+  for (const [ldEnvironmentKey, envConfig] of Object.entries(
     input.ldFlag.environments ?? {},
   )) {
+    if (envKeyMap && !envKeyMap.has(ldEnvironmentKey)) {
+      continue;
+    }
+
+    const environmentKey = mapEnvironmentKey(ldEnvironmentKey, envKeyMap);
     environments[environmentKey] = {
       enabled: Boolean(envConfig.on),
     };
@@ -110,7 +125,7 @@ export function buildFeatureFromLdFlag(input: {
       environmentKey,
       envConfig,
       valueType,
-      resolveSavedGroupId: input.resolveSavedGroupIdForEnv(environmentKey),
+      resolveSavedGroupId: input.resolveSavedGroupIdForEnv(ldEnvironmentKey),
     });
 
     importedRules.push(...built.rules);
@@ -120,16 +135,32 @@ export function buildFeatureFromLdFlag(input: {
     }
   }
 
+  const consolidatedRules = consolidateEquivalentForceRules({
+    ldProjectKey: input.ldProjectKey,
+    flagKey: input.effectiveFeatureId ?? input.ldFlag.key,
+    valueType,
+    rules: importedRules,
+  });
+
+  const featureId = sanitizeFeatureId(
+    input.effectiveFeatureId ?? input.ldFlag.key,
+  );
+  const description =
+    input.effectiveDescription ??
+    input.ldFlag.description ??
+    input.ldFlag.name ??
+    "";
+
   const createPayload: CreateFeaturePayload = {
-    id: sanitizeFeatureId(input.ldFlag.key),
+    id: featureId,
     owner: input.owner,
-    description: input.ldFlag.description ?? input.ldFlag.name ?? "",
+    description,
     project: input.gbProjectId,
     valueType,
     defaultValue,
     tags: input.ldFlag.tags,
     archived: Boolean(input.ldFlag.archived),
-    rules: importedRules,
+    rules: consolidatedRules,
     environments,
     prerequisites:
       prerequisiteKeys.size > 0 ? [...prerequisiteKeys] : undefined,
@@ -137,7 +168,7 @@ export function buildFeatureFromLdFlag(input: {
 
   return {
     createPayload,
-    importedRules,
+    importedRules: consolidatedRules,
     warnings,
     valueType,
     defaultValue,
@@ -172,6 +203,7 @@ export function planFeatureUpdate(input: {
   const merge = mergeImportedRules({
     existingRules,
     importedRules: input.importedRules,
+    valueType: input.existingFeature.valueType,
   });
 
   const changed =
@@ -212,11 +244,6 @@ function environmentsChanged(
   }
 
   return false;
-}
-
-function sanitizeFeatureId(key: string): string {
-  // GrowthBook: letters, numbers, hyphens, underscores
-  return key.replace(/[^A-Za-z0-9_-]/g, "_");
 }
 
 export function listVariationValues(

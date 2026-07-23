@@ -86,15 +86,23 @@ export function createLdClient(config: LdClientConfig) {
     return items;
   }
 
-  async function listFlags(projectKey: string): Promise<LaunchDarklyFlagDetail[]> {
+  async function listFlags(
+    projectKey: string,
+    environmentKeys: string[] = [],
+  ): Promise<LaunchDarklyFlagDetail[]> {
     const items: LaunchDarklyFlagDetail[] = [];
     let offset = 0;
     const limit = 100;
+    // LD omits per-environment targeting unless summary=0 AND env=... are set.
+    const envQuery = environmentKeys
+      .filter((key) => key.trim().length > 0)
+      .map((key) => `&env=${encodeURIComponent(key)}`)
+      .join("");
 
     while (true) {
       const path =
         `/flags/${encodeURIComponent(projectKey)}` +
-        `?summary=false&limit=${limit}&offset=${offset}`;
+        `?summary=0&limit=${limit}&offset=${offset}${envQuery}`;
 
       const response = await ldGet<{
         items?: LaunchDarklyFlagDetail[];
