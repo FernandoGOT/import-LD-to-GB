@@ -19,6 +19,7 @@ import {
   loadImportConfig,
   remapFlag,
   remapProject,
+  resolveFlagKey,
   summarizeImportConfig,
   type ImportConfig,
 } from "./config.js";
@@ -624,6 +625,7 @@ async function main() {
       gbFeaturesByProject.get(gbProject.id) ??
       new Map<string, GrowthBookFeature>();
     const ldFlags = ldFlagsByProject.get(ldProject.key) ?? [];
+    const resolvedFlagKeys = new Map<string, string>();
 
     for (const ldFlag of ldFlags) {
       if (isFlagIgnored(importConfig, ldProject.key, ldFlag.key)) {
@@ -641,6 +643,29 @@ async function main() {
           key: ldFlag.key,
           name: ldFlag.name,
         });
+        const effectiveFeatureId = resolveFlagKey(
+          importConfig,
+          ldProject.key,
+          ldFlag.key,
+        );
+        const collidingLdKey = resolvedFlagKeys.get(effectiveFeatureId);
+        if (collidingLdKey && collidingLdKey !== ldFlag.key) {
+          report.totals.errors += 1;
+          report.actions.push({
+            type: "feature",
+            action: "error",
+            ldProjectKey: ldProject.key,
+            flagKey: ldFlag.key,
+            details:
+              `Colisão de naming: "${ldFlag.key}" e "${collidingLdKey}" resolvem para a mesma feature id "${effectiveFeatureId}".`,
+          });
+          console.error(
+            `[ERRO] ${ldProject.key}/${ldFlag.key}: colisão com ${collidingLdKey} → ${effectiveFeatureId}`,
+          );
+          continue;
+        }
+        resolvedFlagKeys.set(effectiveFeatureId, ldFlag.key);
+
         const envKeyMap = envKeyMapByProject.get(ldProject.key);
 
         const built = buildFeatureFromLdFlag({
@@ -650,7 +675,7 @@ async function main() {
             ? ""
             : gbProject.id,
           owner: GB_FEATURE_OWNER,
-          effectiveFeatureId: remappedFlag.key,
+          effectiveFeatureId,
           effectiveDescription:
             remappedFlag.name ?? ldFlag.description ?? ldFlag.name,
           envKeyMap,

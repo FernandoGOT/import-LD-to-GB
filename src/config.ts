@@ -1,8 +1,19 @@
 import { readFile } from "node:fs/promises";
 import { access } from "node:fs/promises";
 import { constants } from "node:fs";
+import {
+  applyNamingConvention,
+  isFlagNamingConvention,
+  type FlagNamingConvention,
+} from "./naming.js";
+
+export type { FlagNamingConvention } from "./naming.js";
+export { FLAG_NAMING_CONVENTIONS } from "./naming.js";
 
 export type EnvironmentStrategy = "shared" | "unique";
+
+export const DEFAULT_FLAG_NAMING_CONVENTION: FlagNamingConvention =
+  "kebab-case";
 
 export type KeyNameRemap = {
   key?: string;
@@ -39,6 +50,7 @@ export type ImportConfig = {
   };
   environments: IgnoreRemapSection;
   flags: {
+    namingConvention: FlagNamingConvention;
     ignore: FlagScope[];
     remap: FlagRemapEntry[];
   };
@@ -72,7 +84,11 @@ export function emptyImportConfig(): ImportConfig {
   return {
     projects: { ignore: [], remap: {} },
     environments: { ignore: [], remap: {} },
-    flags: { ignore: [], remap: [] },
+    flags: {
+      namingConvention: DEFAULT_FLAG_NAMING_CONVENTION,
+      ignore: [],
+      remap: [],
+    },
     variations: { ignore: [], remap: [] },
   };
 }
@@ -352,6 +368,27 @@ export function remapFlag(
     key: entry.key?.trim() || current.key,
     name: entry.name?.trim() || current.name,
   };
+}
+
+/**
+ * Resolve the GrowthBook feature id for an LD flag key.
+ * Explicit flags.remap[].key wins (no re-casing); otherwise namingConvention applies.
+ */
+export function resolveFlagKey(
+  config: ImportConfig,
+  projectKey: string,
+  ldFlagKey: string,
+): string {
+  const entry = config.flags.remap.find(
+    (item) => item.projectKey === projectKey && item.flagKey === ldFlagKey,
+  );
+  const remappedKey = entry?.key?.trim();
+  if (remappedKey) {
+    return sanitizeFeatureId(remappedKey);
+  }
+  return sanitizeFeatureId(
+    applyNamingConvention(ldFlagKey, config.flags.namingConvention),
+  );
 }
 
 export function sanitizeFeatureId(key: string): string {
@@ -835,16 +872,41 @@ function normalizeKeyNameRemap(raw: unknown, label: string): KeyNameRemap {
 
 function normalizeFlags(raw: unknown): ImportConfig["flags"] {
   if (raw === undefined) {
-    return { ignore: [], remap: [] };
+    return {
+      namingConvention: DEFAULT_FLAG_NAMING_CONVENTION,
+      ignore: [],
+      remap: [],
+    };
   }
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("flags deve ser um objeto.");
   }
   const obj = raw as Record<string, unknown>;
   return {
+    namingConvention: normalizeFlagNamingConvention(obj.namingConvention),
     ignore: normalizeFlagScopeArray(obj.ignore, "flags.ignore"),
     remap: normalizeFlagRemapArray(obj.remap, "flags.remap"),
   };
+}
+
+function normalizeFlagNamingConvention(
+  raw: unknown,
+): FlagNamingConvention {
+  if (raw === undefined) {
+    return DEFAULT_FLAG_NAMING_CONVENTION;
+  }
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw new Error(
+      `flags.namingConvention inválida: ${JSON.stringify(raw)}. Use kebab-case, snake_case, camelCase, PascalCase ou preserve.`,
+    );
+  }
+  const value = raw.trim();
+  if (!isFlagNamingConvention(value)) {
+    throw new Error(
+      `flags.namingConvention inválida: "${value}". Use kebab-case, snake_case, camelCase, PascalCase ou preserve.`,
+    );
+  }
+  return value;
 }
 
 function normalizeVariations(raw: unknown): ImportConfig["variations"] {
@@ -1015,6 +1077,7 @@ export function summarizeImportConfig(config: ImportConfig): Record<string, unkn
     projectsRemapped: Object.keys(config.projects.remap).length,
     environmentsIgnored: config.environments.ignore.length,
     environmentsRemapped: Object.keys(config.environments.remap).length,
+    flagNamingConvention: config.flags.namingConvention,
     flagsIgnored: config.flags.ignore.length,
     flagsRemapped: config.flags.remap.length,
     variationsIgnored: config.variations.ignore.length,

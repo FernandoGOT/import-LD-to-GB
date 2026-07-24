@@ -35,6 +35,7 @@
     }
   },
   "flags": {
+    "namingConvention": "kebab-case",
     "ignore": [
       { "projectKey": "ld-project-shared", "flagKey": "old-flag" }
     ],

@@ -58,6 +58,7 @@ O config é **sempre validado** no início de `migrate` e `sync`. Conflitos abor
     }
   },
   "flags": {
+    "namingConvention": "kebab-case",
     "ignore": [{ "projectKey": "ld-project-shared", "flagKey": "old-flag" }],
     "remap": [
       {
@@ -98,6 +99,9 @@ O config é **sempre validado** no início de `migrate` e `sync`. Conflitos abor
 
 ### Flags e variações
 
+- `flags.namingConvention` normaliza a key LD → id da feature no GrowthBook. Default: `kebab-case`. Valores: `kebab-case`, `snake_case`, `camelCase`, `PascalCase`, `preserve` (só sanitiza charset).
+- Ordem: `flags.remap[].key` explícito (sem re-casar) → senão aplica a convention → `sanitizeFeatureId`.
+- Se o GrowthBook já tiver features com as keys originais do LD, use `"namingConvention": "preserve"` (ou remap pontual) até alinhar os ids.
 - Cada flag exige `projectKey` + `flagKey`.
 - Cada variação exige `projectKey` + `flagKey` + `variationId`.
 - `variationId`: `variation.key` → `_id`/`id` → índice (`"0"`, `"1"`, …). **Não** use o `name` (pode colidir).

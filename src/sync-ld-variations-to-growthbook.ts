@@ -16,9 +16,8 @@ import {
   isFlagIgnored,
   isProjectIgnored,
   loadImportConfig,
-  remapFlag,
   remapProject,
-  sanitizeFeatureId,
+  resolveFlagKey,
   summarizeImportConfig,
   type ImportConfig,
 } from "./config.js";
@@ -281,6 +280,8 @@ async function main() {
       continue;
     }
 
+    const resolvedFlagKeys = new Map<string, string>();
+
     for (const ldFlag of ldFlags) {
       if (isFlagIgnored(importConfig, ldProject.key, ldFlag.key)) {
         report.actions.push({
@@ -293,11 +294,26 @@ async function main() {
         continue;
       }
 
-      const remappedFlag = remapFlag(importConfig, ldProject.key, ldFlag.key, {
-        key: ldFlag.key,
-        name: ldFlag.name,
-      });
-      const effectiveFlagKey = sanitizeFeatureId(remappedFlag.key);
+      const effectiveFlagKey = resolveFlagKey(
+        importConfig,
+        ldProject.key,
+        ldFlag.key,
+      );
+      const collidingLdKey = resolvedFlagKeys.get(effectiveFlagKey);
+      if (collidingLdKey && collidingLdKey !== ldFlag.key) {
+        report.totals.errors += 1;
+        report.actions.push({
+          ldProjectKey: ldProject.key,
+          gbProjectId: gbProject.id,
+          flagKey: ldFlag.key,
+          action: "error",
+          details:
+            `Colisão de naming: "${ldFlag.key}" e "${collidingLdKey}" resolvem para a mesma feature id "${effectiveFlagKey}".`,
+        });
+        continue;
+      }
+      resolvedFlagKeys.set(effectiveFlagKey, ldFlag.key);
+
       const gbFeature = gbFeatureIndex.get(effectiveFlagKey);
 
       if (!gbFeature) {

@@ -14,10 +14,12 @@ import {
   remapProject,
   remapVariation,
   resolveEffectiveEnvironmentTarget,
+  resolveFlagKey,
   resolveVariationSourceId,
   validateImportConfig,
   type ImportConfig,
 } from "./config.js";
+import { applyNamingConvention } from "./naming.js";
 
 function validBase(): ImportConfig {
   return normalizeImportConfig({
@@ -493,5 +495,116 @@ describe("project / flag / variation helpers", () => {
     ]);
     expect(otherFlag).toHaveLength(2);
     expect(otherFlag[0]?.name).toBe("Control");
+  });
+});
+
+describe("flag naming convention", () => {
+  it("defaults namingConvention to kebab-case", () => {
+    expect(emptyImportConfig().flags.namingConvention).toBe("kebab-case");
+    expect(normalizeImportConfig({}).flags.namingConvention).toBe("kebab-case");
+    expect(normalizeImportConfig({ flags: {} }).flags.namingConvention).toBe(
+      "kebab-case",
+    );
+  });
+
+  it("rejects invalid namingConvention", () => {
+    expect(() =>
+      normalizeImportConfig({ flags: { namingConvention: "Title Case" } }),
+    ).toThrow(/namingConvention inválida/);
+  });
+
+  it("transforms common LD key styles to kebab-case", () => {
+    expect(applyNamingConvention("RolloutHomeBetAgain", "kebab-case")).toBe(
+      "rollout-home-bet-again",
+    );
+    expect(applyNamingConvention("configureCartCrossSell", "kebab-case")).toBe(
+      "configure-cart-cross-sell",
+    );
+    expect(
+      applyNamingConvention(
+        "allow-check-if-user-should-see-promotions-carousel",
+        "kebab-case",
+      ),
+    ).toBe("allow-check-if-user-should-see-promotions-carousel");
+    expect(applyNamingConvention("XMLParser", "kebab-case")).toBe("xml-parser");
+    expect(applyNamingConvention("foo_bar", "kebab-case")).toBe("foo-bar");
+  });
+
+  it("supports other conventions and preserve", () => {
+    expect(applyNamingConvention("RolloutHomeBetAgain", "snake_case")).toBe(
+      "rollout_home_bet_again",
+    );
+    expect(applyNamingConvention("rollout-home-bet-again", "camelCase")).toBe(
+      "rolloutHomeBetAgain",
+    );
+    expect(applyNamingConvention("rollout-home-bet-again", "PascalCase")).toBe(
+      "RolloutHomeBetAgain",
+    );
+    expect(applyNamingConvention("RolloutHomeBetAgain", "preserve")).toBe(
+      "RolloutHomeBetAgain",
+    );
+  });
+
+  it("resolveFlagKey applies convention then sanitize", () => {
+    const config = normalizeImportConfig({});
+    expect(resolveFlagKey(config, "p", "configureCartCrossSell")).toBe(
+      "configure-cart-cross-sell",
+    );
+    expect(resolveFlagKey(config, "p", "flag.with.dots")).toBe(
+      "flag_with_dots",
+    );
+  });
+
+  it("resolveFlagKey respects preserve mode", () => {
+    const config = normalizeImportConfig({
+      flags: { namingConvention: "preserve" },
+    });
+    expect(resolveFlagKey(config, "p", "configureCartCrossSell")).toBe(
+      "configureCartCrossSell",
+    );
+  });
+
+  it("explicit remap key skips naming convention", () => {
+    const config = normalizeImportConfig({
+      flags: {
+        namingConvention: "kebab-case",
+        remap: [
+          {
+            projectKey: "p",
+            flagKey: "configureCartCrossSell",
+            key: "CartCrossSell",
+          },
+        ],
+      },
+    });
+    expect(resolveFlagKey(config, "p", "configureCartCrossSell")).toBe(
+      "CartCrossSell",
+    );
+  });
+
+  it("remap that only sets name still applies naming convention to key", () => {
+    const config = normalizeImportConfig({
+      flags: {
+        namingConvention: "kebab-case",
+        remap: [
+          {
+            projectKey: "p",
+            flagKey: "configureCartCrossSell",
+            name: "Cart cross sell",
+          },
+        ],
+      },
+    });
+    expect(resolveFlagKey(config, "p", "configureCartCrossSell")).toBe(
+      "configure-cart-cross-sell",
+    );
+  });
+
+  it("detects that PascalCase and kebab-case LD keys collide under kebab-case", () => {
+    const config = normalizeImportConfig({
+      flags: { namingConvention: "kebab-case" },
+    });
+    expect(resolveFlagKey(config, "p", "FooBar")).toBe("foo-bar");
+    expect(resolveFlagKey(config, "p", "foo-bar")).toBe("foo-bar");
   });
 });
